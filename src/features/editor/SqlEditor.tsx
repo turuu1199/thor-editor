@@ -824,7 +824,9 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
                 result={active.result}
                 dialect={dialect}
                 fetchEdges={graphDb ? fetchEdges : undefined}
-                onExport={() => setExportFor(active)}
+                onExport={(v) => setExportFor({ ...active, result: v.result, sql: v.sql ?? active.sql })}
+                sql={active.sql}
+                runQuery={(q, all) => api.execute(conn.info.sessionId, q, all ? 0 : settings.fetchSize)}
                 edit={editTargets[active.id] ?? undefined}
                 onApplySql={(stmts, commit) => applyGridChanges(active, stmts, commit)}
                 autocommit={conn.autocommit}

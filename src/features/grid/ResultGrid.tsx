@@ -9,9 +9,9 @@ import DataEditor, {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import clsx from "clsx";
-import { ArrowDown, ArrowUp, Ban, ClipboardCopy, Download, PanelRight, Plus, Search, Trash2, Undo2, Save } from "lucide-react";
+import { ArrowDown, ArrowUp, Ban, ClipboardCopy, Download, PanelRight, Plus, Search, Trash2, Undo2, Save, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, IconButton, Input, Select, Tabs } from "../../components/ui";
+import { Button, IconButton, Input, Select, Spinner, Tabs } from "../../components/ui";
 import { GraphView, hasGraph } from "./GraphView";
 import { displayValue, formatRows, prettyValue, type CopyFormat } from "../../lib/format";
 import type { CellValue, ColumnInfo, Dialect, QueryResult } from "../../lib/ipc";
@@ -26,8 +26,12 @@ export interface EditTarget {
 interface Props {
   result: QueryResult;
   dialect: Dialect;
-  onExport?: () => void;
+  /** `view`: the rows on screen — a server-side sorted/filtered re-run when there is one. */
+  onExport?: (view: { result: QueryResult; sql?: string }) => void;
   onFetchAll?: () => void;
+  /** Query behind `result`; with `runQuery`, sorting/filtering a truncated result re-runs it on the server. */
+  sql?: string;
+  runQuery?: (sql: string, all: boolean) => Promise<QueryResult>;
   edit?: EditTarget;
   /** Executes generated DML (then commits when `commit`); resolves when done. */
   onApplySql?: (statements: string[], commit: boolean) => Promise<void>;
@@ -38,6 +42,25 @@ interface Props {
 }
 
 type Sort = { col: number; dir: 1 | -1 } | null;
+
+type FilterOp = "contains" | "starts" | "eq" | "ne" | "gt" | "lt" | "ge" | "le" | "null" | "notnull";
+type ColFilter = { op: FilterOp; value: string };
+
+const FILTER_OPS: [FilterOp, string][] = [
+  ["contains", "contains"],
+  ["starts", "starts with"],
+  ["eq", "="],
+  ["ne", "≠"],
+  ["gt", ">"],
+  ["ge", "≥"],
+  ["lt", "<"],
+  ["le", "≤"],
+  ["null", "is NULL"],
+  ["notnull", "is not NULL"],
+];
+const OP_SQL: Partial<Record<FilterOp, string>> = { eq: "=", ne: "<>", gt: ">", lt: "<", ge: ">=", le: "<=" };
+const OP_LABEL = Object.fromEntries(FILTER_OPS) as Record<FilterOp, string>;
+const needsValue = (op: FilterOp) => op !== "null" && op !== "notnull";
 
 /** Binary / LONG columns can't round-trip through a text literal. */
 const NON_EDITABLE = /^(BLOB|BFILE|RAW|LONG|BYTEA|VARBINARY|BINARY|IMAGE|GEOMETRY|GEOGRAPHY|XMLTYPE|SDO_)/i;
@@ -66,8 +89,69 @@ function compare(a: CellValue, b: CellValue): number {
   return String(a).localeCompare(String(b), undefined, { numeric: true });
 }
 
-export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onApplySql, autocommit = true, fetchEdges }: Props) {
+/** Client-side test of one column filter. */
+function matches(v: CellValue, f: ColFilter): boolean {
+  if (f.op === "null") return v === null;
+  if (f.op === "notnull") return v !== null;
+  if (v === null) return false;
+  const s = String(v).toLowerCase(), q = f.value.toLowerCase();
+  if (f.op === "contains") return s.includes(q);
+  if (f.op === "starts") return s.startsWith(q);
+  const c = compare(v, f.value);
+  return f.op === "eq" ? c === 0 : f.op === "ne" ? c !== 0 : f.op === "gt" ? c > 0 : f.op === "lt" ? c < 0 : f.op === "ge" ? c >= 0 : c <= 0;
+}
+
+/** Column as text, for LIKE filters. */
+function textExpr(d: Dialect, col: string, typeName: string): string {
+  switch (d) {
+    case "oracle":
+      if (/^(DATE|TIMESTAMP)/i.test(typeName)) return `TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS')`;
+      return /LOB/i.test(typeName) ? col : `TO_CHAR(${col})`;
+    case "postgres":
+      return `CAST(${col} AS TEXT)`;
+    case "mysql":
+      return `CAST(${col} AS CHAR)`;
+    case "mssql":
+      return `CAST(${col} AS NVARCHAR(MAX))`;
+    case "clickhouse":
+      return `toString(${col})`;
+    default:
+      return col;
+  }
+}
+
+/** `sql` wrapped so the server applies the column filters and sort. */
+function wrapQuery(d: Dialect, sql: string, columns: QueryResult["columns"], filters: Record<number, ColFilter>, sort: Sort): string {
+  const where = Object.entries(filters).map(([i, f]) => {
+    const meta = columns[Number(i)];
+    const col = quoteIdent(d, meta.name);
+    if (f.op === "null") return `${col} IS NULL`;
+    if (f.op === "notnull") return `${col} IS NOT NULL`;
+    if (f.op === "contains" || f.op === "starts") {
+      const pattern = literal(d, (f.op === "contains" ? "%" : "") + f.value + "%");
+      return d === "postgres" ? `${textExpr(d, col, meta.typeName)} ILIKE ${pattern}` : `UPPER(${textExpr(d, col, meta.typeName)}) LIKE UPPER(${pattern})`;
+    }
+    const v: CellValue = meta.numeric && f.value.trim() !== "" && !isNaN(Number(f.value)) ? Number(f.value) : f.value;
+    return `${col} ${OP_SQL[f.op]} ${valueSql(d, meta.typeName, v)}`;
+  });
+  const inner = sql.trim().replace(/;\s*$/, "");
+  return (
+    `SELECT * FROM (\n${inner}\n) q` +
+    (where.length ? `\nWHERE ${where.join("\n  AND ")}` : "") +
+    (sort ? `\nORDER BY ${quoteIdent(d, columns[sort.col].name)} ${sort.dir === 1 ? "ASC" : "DESC"}` : "")
+  );
+}
+
+export function ResultGrid({ result: base, dialect, onExport, onFetchAll, sql, runQuery, edit, onApplySql, autocommit = true, fetchEdges }: Props) {
   const colors = useThemeColors();
+  // Server-side sorted/filtered re-run of a truncated result (null: showing `base`).
+  const [served, setServed] = useState<{ result: QueryResult; sql: string } | null>(null);
+  const result = served?.result ?? base;
+  const serverMode = !!runQuery && !!sql && base.truncated;
+  const [colFilters, setColFilters] = useState<Record<number, ColFilter>>({});
+  const [colMenu, setColMenu] = useState<{ col: number; x: number; y: number; op: FilterOp; value: string } | null>(null);
+  const [requerying, setRequerying] = useState(false);
+  const [requeryError, setRequeryError] = useState("");
   const [sort, setSort] = useState<Sort>(null);
   const [filter, setFilter] = useState("");
   const [widths, setWidths] = useState<Record<number, number>>({});
@@ -88,23 +172,75 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  // A new query result starts unsorted and unfiltered.
   useEffect(() => {
     setSort(null);
+    setColFilters({});
+    setServed(null);
+    setRequeryError("");
+    setWidths({});
+  }, [base.resultId]);
+
+  // Row indices refer to the rows on screen: pending edits don't survive a re-run.
+  useEffect(() => {
     setEdits(new Map());
     setDeleted(new Set());
     setAdded([]);
     setPreview(null);
-    setWidths({});
   }, [result.resultId]);
 
-  // Row index mapping (filter + sort) over the original rows.
+  const headerContext = useRef(false);
+  const openColMenu = (col: number, x: number, y: number) => {
+    const f = colFilters[col];
+    setColMenu({ col, x, y, op: f?.op ?? "contains", value: f?.value ?? "" });
+  };
+
+  /** Applies a new sort / column filter set: on the server for truncated results, else locally. */
+  const applyView = async (nextSort: Sort, nextFilters: Record<number, ColFilter>) => {
+    setSort(nextSort);
+    setColFilters(nextFilters);
+    setColMenu(null);
+    if (!serverMode) return;
+    if (!nextSort && !Object.keys(nextFilters).length) {
+      setServed(null);
+      return;
+    }
+    const wrapped = wrapQuery(dialect, sql!, base.columns, nextFilters, nextSort);
+    setRequerying(true);
+    setRequeryError("");
+    try {
+      setServed({ result: await runQuery!(wrapped, false), sql: wrapped });
+    } catch (e) {
+      setRequeryError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRequerying(false);
+    }
+  };
+
+  const fetchAll = async () => {
+    if (!served) return onFetchAll?.();
+    setRequerying(true);
+    try {
+      setServed({ result: await runQuery!(served.sql, true), sql: served.sql });
+    } catch (e) {
+      setRequeryError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRequerying(false);
+    }
+  };
+
+  // Row index mapping (filter + sort) over the loaded rows; server-side views come pre-sorted/filtered.
   const order = useMemo(() => {
     let idx = result.rows.map((_, i) => i);
     const q = filter.trim().toLowerCase();
     if (q) idx = idx.filter((i) => result.rows[i].some((v) => v !== null && String(v).toLowerCase().includes(q)));
-    if (sort) idx.sort((a, b) => compare(result.rows[a][sort.col], result.rows[b][sort.col]) * sort.dir);
+    if (!serverMode) {
+      const fs = Object.entries(colFilters).map(([c, f]) => [Number(c), f] as const);
+      if (fs.length) idx = idx.filter((i) => fs.every(([c, f]) => matches(result.rows[i][c], f)));
+      if (sort) idx.sort((a, b) => compare(result.rows[a][sort.col], result.rows[b][sort.col]) * sort.dir);
+    }
     return idx;
-  }, [result.rows, filter, sort]);
+  }, [result.rows, filter, sort, colFilters, serverMode]);
 
   // Result column -> table column (undefined: expression / not in the table, read-only).
   const tableCols = useMemo(
@@ -129,9 +265,16 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
         const sample = result.rows.slice(0, 50).reduce((m, r) => Math.max(m, displayValue(r[i]).length), 0);
         const w = widths[i] ?? Math.min(360, Math.max(70, Math.max(c.name.length + 3, sample) * 7.5 + 16));
         const arrow = sort?.col === i ? (sort.dir === 1 ? " ▲" : " ▼") : "";
-        return { id: String(i), title: c.name + arrow, width: w };
+        const filtered = i in colFilters;
+        return {
+          id: String(i),
+          title: c.name + arrow,
+          width: w,
+          hasMenu: true,
+          themeOverride: filtered ? { textHeader: colors.accent, bgHeader: colors.accentSoft } : undefined,
+        };
       }),
-    [result.columns, result.rows, widths, sort],
+    [result.columns, result.rows, widths, sort, colFilters, colors],
   );
 
   const valueAt = useCallback(
@@ -355,7 +498,7 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
           <option value="in-list">IN (…) list</option>
         </Select>
         {onExport && (
-          <Button size="sm" onClick={onExport} title="Export to file (CSV, Excel, JSON, SQL…)">
+          <Button size="sm" onClick={() => onExport({ result, sql: served?.sql })} title="Export to file (CSV, Excel, JSON, SQL…)">
             <Download size={13} /> Export
           </Button>
         )}
@@ -417,6 +560,10 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
           className="relative min-w-0 flex-1"
           onContextMenu={(e) => {
             e.preventDefault();
+            if (headerContext.current) {
+              headerContext.current = false;
+              return;
+            }
             setMenu({ x: e.clientX, y: e.clientY });
           }}
         >
@@ -436,9 +583,12 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
               gridSelection={selection}
               onGridSelectionChange={setSelection}
               onColumnResize={(_c, w, i) => setWidths((p) => ({ ...p, [i]: w }))}
-              onHeaderClicked={(col) =>
-                setSort((s) => (s?.col !== col ? { col, dir: 1 } : s.dir === 1 ? { col, dir: -1 } : null))
-              }
+              onHeaderContextMenu={(col, e) => {
+                e.preventDefault();
+                headerContext.current = true; // keep the cell menu from opening too
+                openColMenu(col, e.bounds.x + e.localEventX, e.bounds.y + e.localEventY);
+              }}
+              onHeaderMenuClick={(col, r) => openColMenu(col, r.x, r.y + r.height)}
               rowMarkers="clickable-number"
               smoothScrollX
               smoothScrollY
@@ -488,7 +638,7 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
                   </>
                 )}
                 {onExport && (
-                  <button className="flex w-full items-center gap-2 border-t border-line px-3 py-1 text-left hover:bg-hover" onClick={() => { setMenu(null); onExport(); }}>
+                  <button className="flex w-full items-center gap-2 border-t border-line px-3 py-1 text-left hover:bg-hover" onClick={() => { setMenu(null); onExport({ result, sql: served?.sql }); }}>
                     <Download size={13} className="text-muted" /> Export…
                   </button>
                 )}
@@ -519,8 +669,8 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
         {result.truncated && (
           <span className="text-warn">
             First {result.rows.length.toLocaleString()} rows fetched.
-            {onFetchAll && (
-              <button className="ml-1 underline hover:text-fg" onClick={onFetchAll}>
+            {(onFetchAll || served) && (
+              <button className="ml-1 underline hover:text-fg" onClick={fetchAll}>
                 Fetch all
               </button>
             )}
@@ -531,8 +681,101 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
             sorted by {result.columns[sort.col]?.name} {sort.dir === 1 ? <ArrowUp size={11} /> : <ArrowDown size={11} />}
           </span>
         )}
+        {Object.entries(colFilters).map(([c, f]) => (
+          <span key={c} className="inline-flex items-center gap-1 rounded bg-accent-soft px-1.5 text-fg">
+            {result.columns[Number(c)]?.name} {OP_LABEL[f.op]} {needsValue(f.op) && `"${f.value}"`}
+            <button
+              className="text-muted hover:text-fg"
+              title="Remove filter"
+              onClick={() => {
+                const { [Number(c)]: _, ...rest } = colFilters;
+                applyView(sort, rest);
+              }}
+            >
+              <X size={11} />
+            </button>
+          </span>
+        ))}
+        {serverMode && (sort || Object.keys(colFilters).length > 0) && <span title="Sort and filters run on the server over all rows">(server-side)</span>}
+        {requerying && <Spinner size={11} />}
+        {requeryError && (
+          <span className="truncate text-danger select-text" title={requeryError}>
+            {requeryError}
+          </span>
+        )}
         <span className="ml-auto">{result.elapsedMs.toLocaleString()} ms</span>
       </div>
+
+      {colMenu && (
+        <div className="fixed inset-0 z-40" onMouseDown={() => setColMenu(null)}>
+          <div
+            className="absolute w-64 rounded-md border border-line bg-panel py-1 text-[13px] shadow-xl"
+            style={{ left: Math.min(colMenu.x, window.innerWidth - 270), top: Math.min(colMenu.y, window.innerHeight - 250) }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="truncate px-3 py-1 text-xs font-semibold text-muted">{result.columns[colMenu.col]?.name}</div>
+            {(
+              [
+                [1, "Sort ascending", ArrowUp],
+                [-1, "Sort descending", ArrowDown],
+              ] as const
+            ).map(([dir, label, Icon]) => (
+              <button
+                key={dir}
+                className={clsx("flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-hover", sort?.col === colMenu.col && sort.dir === dir && "text-accent")}
+                onClick={() => applyView({ col: colMenu.col, dir }, colFilters)}
+              >
+                <Icon size={13} /> {label}
+              </button>
+            ))}
+            {sort?.col === colMenu.col && (
+              <button className="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-hover" onClick={() => applyView(null, colFilters)}>
+                <X size={13} /> Clear sort
+              </button>
+            )}
+            <form
+              className="mt-1 space-y-1.5 border-t border-line px-3 pt-2 pb-1"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (needsValue(colMenu.op) && colMenu.value === "") return;
+                applyView(sort, { ...colFilters, [colMenu.col]: { op: colMenu.op, value: colMenu.value } });
+              }}
+            >
+              <div className="text-xs text-muted">Filter</div>
+              <div className="flex gap-1">
+                <Select className="h-7 w-28 text-xs" value={colMenu.op} onChange={(e) => setColMenu({ ...colMenu, op: e.target.value as FilterOp })}>
+                  {FILTER_OPS.map(([op, label]) => (
+                    <option key={op} value={op}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+                {needsValue(colMenu.op) && (
+                  <Input autoFocus className="h-7 min-w-0 flex-1 text-xs" value={colMenu.value} onChange={(e) => setColMenu({ ...colMenu, value: e.target.value })} />
+                )}
+              </div>
+              <div className="flex justify-end gap-1">
+                {colMenu.col in colFilters && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      const { [colMenu.col]: _, ...rest } = colFilters;
+                      applyView(sort, rest);
+                    }}
+                  >
+                    Clear
+                  </Button>
+                )}
+                <Button type="submit" size="sm" variant="primary">
+                  Apply
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onMouseDown={() => setPreview(null)}>
