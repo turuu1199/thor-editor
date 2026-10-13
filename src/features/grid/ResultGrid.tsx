@@ -37,6 +37,11 @@ interface Props {
 
 type Sort = { col: number; dir: 1 | -1 } | null;
 
+// WebKitGTK (Tauri on Linux) corrupts glide's scroll blit, which drawImage()s the canvas onto
+// itself — glyphs come out torn until the cell is repainted. Redraw directly there instead.
+const isWebKitGtk = /Linux/.test(navigator.userAgent) && /AppleWebKit/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
+const gridExperimental = isWebKitGtk ? { renderStrategy: "direct" as const } : undefined;
+
 function compare(a: CellValue, b: CellValue): number {
   if (a === b) return 0;
   if (a === null) return 1;
@@ -315,6 +320,7 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
               rowHeight={26}
               headerHeight={28}
               keybindings={{ search: true, copy: true, selectAll: true }}
+              experimental={gridExperimental}
             />
           ) : (
             <div className="p-6 text-muted">No columns.</div>

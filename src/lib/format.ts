@@ -49,8 +49,8 @@ export function formatRows(
 export function displayValue(v: CellValue): string {
   if (v === null) return "NULL";
   if (typeof v === "boolean") return v ? "true" : "false";
-  const s = String(v);
-  return s.length > 500 ? s.slice(0, 500) + "…" : s.replace(/\r?\n/g, " ↵ ");
+  const s = String(v).replace(/\r?\n/g, " ↵ ");
+  return s.length > 500 ? s.slice(0, 500) + "…" : s;
 }
 
 export function prettyValue(v: CellValue): string {
