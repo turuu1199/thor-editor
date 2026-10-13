@@ -9,7 +9,7 @@ import DataEditor, {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import clsx from "clsx";
-import { ArrowDown, ArrowUp, ClipboardCopy, Download, PanelRight, Search, Undo2, Save } from "lucide-react";
+import { ArrowDown, ArrowUp, Ban, ClipboardCopy, Download, PanelRight, Plus, Search, Trash2, Undo2, Save } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, IconButton, Input, Select, Tabs } from "../../components/ui";
 import { GraphView, hasGraph } from "./GraphView";
@@ -29,13 +29,27 @@ interface Props {
   onExport?: () => void;
   onFetchAll?: () => void;
   edit?: EditTarget;
-  /** Executes generated DML; resolves when done. */
-  onApplySql?: (statements: string[]) => Promise<void>;
+  /** Executes generated DML (then commits when `commit`); resolves when done. */
+  onApplySql?: (statements: string[], commit: boolean) => Promise<void>;
+  /** Session auto-commit state: offers "Execute & Commit" when off. */
+  autocommit?: boolean;
   /** Graph engines: loads edges between result nodes for the graph view. */
   fetchEdges?: (ids: string[]) => Promise<Record<string, unknown>[]>;
 }
 
 type Sort = { col: number; dir: 1 | -1 } | null;
+
+/** Binary / LONG columns can't round-trip through a text literal. */
+const NON_EDITABLE = /^(BLOB|BFILE|RAW|LONG|BYTEA|VARBINARY|BINARY|IMAGE|GEOMETRY|GEOGRAPHY|XMLTYPE|SDO_)/i;
+
+/** SQL for a value written into `dataType`; Oracle needs explicit date/timestamp conversion. */
+function valueSql(d: Dialect, dataType: string, v: CellValue): string {
+  if (d === "oracle" && typeof v === "string" && v !== "") {
+    if (/^DATE\b/i.test(dataType)) return `TO_DATE(${literal(d, v.slice(0, 19))}, '${v.length > 10 ? "YYYY-MM-DD HH24:MI:SS" : "YYYY-MM-DD"}')`;
+    if (/^TIMESTAMP\b(?!.*TIME ZONE)/i.test(dataType)) return `TO_TIMESTAMP(${literal(d, v)}, 'YYYY-MM-DD HH24:MI:SS.FF')`;
+  }
+  return literal(d, v);
+}
 
 // WebKitGTK (Tauri on Linux) corrupts glide's scroll blit, which drawImage()s the canvas onto
 // itself — glyphs come out torn until the cell is repainted. Redraw directly there instead.
@@ -52,7 +66,7 @@ function compare(a: CellValue, b: CellValue): number {
   return String(a).localeCompare(String(b), undefined, { numeric: true });
 }
 
-export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onApplySql, fetchEdges }: Props) {
+export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onApplySql, autocommit = true, fetchEdges }: Props) {
   const colors = useThemeColors();
   const [sort, setSort] = useState<Sort>(null);
   const [filter, setFilter] = useState("");
@@ -66,14 +80,19 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
   const [mode, setMode] = useState<"table" | "graph">("table");
   useEffect(() => setMode(graphable ? "graph" : "table"), [graphable, result.resultId]);
   const [edits, setEdits] = useState<Map<number, Map<number, CellValue>>>(new Map());
+  const [deleted, setDeleted] = useState<Set<number>>(new Set());
+  const [added, setAdded] = useState<CellValue[][]>([]);
   const [preview, setPreview] = useState<string[] | null>(null);
   const [applyError, setApplyError] = useState("");
+  const [applying, setApplying] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setSort(null);
     setEdits(new Map());
+    setDeleted(new Set());
+    setAdded([]);
     setPreview(null);
     setWidths({});
   }, [result.resultId]);
@@ -87,12 +106,22 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
     return idx;
   }, [result.rows, filter, sort]);
 
-  const pkCols = useMemo(() => {
-    if (!edit) return [];
-    const pk = edit.columns.filter((c) => c.primaryKey).map((c) => c.name);
-    return pk.map((n) => result.columns.findIndex((c) => c.name.toLowerCase() === n.toLowerCase())).filter((i) => i >= 0);
-  }, [edit, result.columns]);
-  const editable = !!edit && pkCols.length > 0 && !!onApplySql;
+  // Result column -> table column (undefined: expression / not in the table, read-only).
+  const tableCols = useMemo(
+    () => result.columns.map((c) => edit?.columns.find((t) => t.name.toLowerCase() === c.name.toLowerCase())),
+    [edit, result.columns],
+  );
+  const writable = useCallback((col: number) => !!tableCols[col] && !NON_EDITABLE.test(tableCols[col]!.dataType), [tableCols]);
+  // Row identity: the primary key when the result has all of it, else every comparable column.
+  const { keyCols, byPk } = useMemo(() => {
+    if (!edit) return { keyCols: [] as number[], byPk: false };
+    const pk = edit.columns.filter((c) => c.primaryKey);
+    const pkIdx = pk.map((t) => tableCols.indexOf(t));
+    if (pk.length && pkIdx.every((i) => i >= 0)) return { keyCols: pkIdx, byPk: true };
+    return { keyCols: result.columns.map((_, i) => i).filter((i) => writable(i) && !/LOB|TEXT/i.test(tableCols[i]!.dataType)), byPk: false };
+  }, [edit, tableCols, result.columns, writable]);
+  const editable = !!edit && keyCols.length > 0 && !!onApplySql;
+  const pending = edits.size + deleted.size + added.length;
 
   const columns: GridColumn[] = useMemo(
     () =>
@@ -107,66 +136,141 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
 
   const valueAt = useCallback(
     (row: number, col: number): CellValue => {
+      if (row >= order.length) return added[row - order.length]?.[col] ?? null;
       const orig = order[row];
       const e = edits.get(orig);
       if (e?.has(col)) return e.get(col)!;
       return result.rows[orig]?.[col] ?? null;
     },
-    [order, edits, result.rows],
+    [order, edits, added, result.rows],
   );
 
   const getCellContent = useCallback(
     ([col, row]: Item): GridCell => {
       const v = valueAt(row, col);
       const meta = result.columns[col];
-      const edited = edits.get(order[row])?.has(col);
+      const isNew = row >= order.length;
+      const isDeleted = !isNew && deleted.has(order[row]);
+      const edited = !isNew && edits.get(order[row])?.has(col);
+      const bgCell = isDeleted ? colors.deleteBg : isNew ? colors.insertBg : edited ? colors.editBg : undefined;
       return {
         kind: GridCellKind.Text,
         data: v === null ? "" : String(v),
         displayData: displayValue(v),
         allowOverlay: true,
-        readonly: !editable,
+        readonly: !editable || isDeleted || !writable(col),
         contentAlign: meta?.numeric ? "right" : "left",
-        themeOverride: v === null ? { textDark: colors.muted } : edited ? { bgCell: colors.editBg } : undefined,
+        themeOverride: bgCell || v === null ? { ...(bgCell && { bgCell }), ...(v === null && { textDark: colors.muted }) } : undefined,
       };
     },
-    [valueAt, result.columns, edits, order, editable, colors],
+    [valueAt, result.columns, edits, deleted, order, editable, writable, colors],
   );
 
   const onCellEdited = useCallback(
     ([col, row]: Item, cell: EditableGridCell) => {
       if (cell.kind !== GridCellKind.Text) return;
-      const orig = order[row];
       const raw = cell.data;
+      const typed = (v: string): CellValue =>
+        !result.columns[col].numeric ? v : v === "" ? null : !isNaN(Number(v)) ? Number(v) : v;
+      if (row >= order.length) {
+        const i = row - order.length;
+        setAdded((prev) => prev.map((r, k) => (k === i ? r.map((v, c) => (c === col ? (raw === "" ? null : typed(raw)) : v)) : r)));
+        return;
+      }
+      const orig = order[row];
       const original = result.rows[orig][col];
-      const newVal: CellValue = raw === "" && original === null ? null : result.columns[col].numeric && raw !== "" && !isNaN(Number(raw)) ? Number(raw) : raw;
-      setEdits((prev) => {
-        const next = new Map(prev);
-        const m = new Map(next.get(orig) ?? []);
-        if (newVal === original) m.delete(col);
-        else m.set(col, newVal);
-        if (m.size) next.set(orig, m);
-        else next.delete(orig);
-        return next;
-      });
+      const newVal: CellValue = raw === "" && original === null ? null : typed(raw);
+      setCellValue(orig, col, newVal);
     },
     [order, result.rows, result.columns],
   );
 
-  const buildUpdates = (): string[] => {
+  const setCellValue = (orig: number, col: number, newVal: CellValue) => {
+    const original = result.rows[orig][col];
+    setEdits((prev) => {
+      const next = new Map(prev);
+      const m = new Map(next.get(orig) ?? []);
+      if (newVal === original) m.delete(col);
+      else m.set(col, newVal);
+      if (m.size) next.set(orig, m);
+      else next.delete(orig);
+      return next;
+    });
+  };
+
+  const colSql = (c: number) => quoteIdent(dialect, tableCols[c]!.name);
+  const valSql = (c: number, v: CellValue) => valueSql(dialect, tableCols[c]!.dataType, v);
+
+  const buildStatements = (): string[] => {
     if (!edit) return [];
-    const stmts: string[] = [];
-    for (const [orig, changes] of edits) {
-      const sets = [...changes.entries()].map(([c, v]) => `${quoteIdent(dialect, result.columns[c].name)} = ${literal(dialect, v)}`);
-      const where = pkCols
+    const where = (orig: number) =>
+      keyCols
         .map((c) => {
           const v = result.rows[orig][c];
-          return v === null ? `${quoteIdent(dialect, result.columns[c].name)} IS NULL` : `${quoteIdent(dialect, result.columns[c].name)} = ${literal(dialect, v)}`;
+          return v === null ? `${colSql(c)} IS NULL` : `${colSql(c)} = ${valSql(c, v)}`;
         })
         .join(" AND ");
-      stmts.push(`UPDATE ${edit.table} SET ${sets.join(", ")} WHERE ${where}`);
+    const stmts: string[] = [];
+    for (const orig of deleted) stmts.push(`DELETE FROM ${edit.table} WHERE ${where(orig)}`);
+    for (const [orig, changes] of edits) {
+      if (deleted.has(orig)) continue;
+      const sets = [...changes.entries()].map(([c, v]) => `${colSql(c)} = ${valSql(c, v)}`);
+      stmts.push(`UPDATE ${edit.table} SET ${sets.join(", ")} WHERE ${where(orig)}`);
+    }
+    for (const row of added) {
+      // Omitted (NULL) columns keep their defaults.
+      const cols = row.map((_, c) => c).filter((c) => row[c] !== null && writable(c));
+      if (!cols.length) continue;
+      stmts.push(`INSERT INTO ${edit.table} (${cols.map(colSql).join(", ")}) VALUES (${cols.map((c) => valSql(c, row[c])).join(", ")})`);
     }
     return stmts;
+  };
+
+  const addRow = () => {
+    setAdded((prev) => [...prev, result.columns.map(() => null)]);
+    setFilter("");
+  };
+
+  /** Grid rows targeted by row actions: selected row markers, else the rows of the cell selection. */
+  const targetRows = (): number[] => {
+    if (selection.rows.length) return selection.rows.toArray();
+    const r = selection.current?.range;
+    return r ? Array.from({ length: r.height }, (_, k) => r.y + k) : [];
+  };
+
+  const toggleDelete = (rows = targetRows()) => {
+    const newRows = new Set(rows.filter((r) => r >= order.length).map((r) => r - order.length));
+    const existing = rows.filter((r) => r < order.length).map((r) => order[r]);
+    if (newRows.size) setAdded((prev) => prev.filter((_, i) => !newRows.has(i)));
+    if (existing.length)
+      setDeleted((prev) => {
+        const next = new Set(prev);
+        const restore = existing.every((o) => next.has(o));
+        for (const o of existing) restore ? next.delete(o) : next.add(o);
+        return next;
+      });
+    setSelection({ columns: CompactSelection.empty(), rows: CompactSelection.empty() });
+    setMenu(null);
+  };
+
+  const setNull = () => {
+    const r = selection.current?.range;
+    if (!r) return;
+    for (let y = r.y; y < r.y + r.height; y++)
+      for (let x = r.x; x < r.x + r.width; x++) {
+        if (!writable(x)) continue;
+        if (y >= order.length) {
+          const i = y - order.length;
+          setAdded((prev) => prev.map((row, k) => (k === i ? row.map((v, c) => (c === x ? null : v)) : row)));
+        } else if (!deleted.has(order[y])) setCellValue(order[y], x, null);
+      }
+    setMenu(null);
+  };
+
+  const discard = () => {
+    setEdits(new Map());
+    setDeleted(new Set());
+    setAdded([]);
   };
 
   const selectedRows = (): CellValue[][] => {
@@ -255,19 +359,37 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
             <Download size={13} /> Export
           </Button>
         )}
-        {edits.size > 0 && (
+        {editable && mode === "table" && (
           <>
             <div className="mx-1 h-5 w-px bg-line" />
-            <span className="text-xs text-warn">{edits.size} modified row(s)</span>
-            <Button size="sm" variant="primary" onClick={() => { setApplyError(""); setPreview(buildUpdates()); }}>
+            <IconButton title="Add row" onClick={addRow}>
+              <Plus size={15} />
+            </IconButton>
+            <IconButton title="Delete / restore selected rows (Del on selected row numbers)" onClick={() => toggleDelete()}>
+              <Trash2 size={14} />
+            </IconButton>
+          </>
+        )}
+        {pending > 0 && (
+          <>
+            <div className="mx-1 h-5 w-px bg-line" />
+            <span className="text-xs text-warn">
+              {[edits.size && `${edits.size} modified`, added.length && `${added.length} new`, deleted.size && `${deleted.size} deleted`].filter(Boolean).join(", ")}
+            </span>
+            <Button size="sm" variant="primary" onClick={() => { setApplyError(""); setPreview(buildStatements()); }}>
               <Save size={13} /> Review &amp; apply
             </Button>
-            <Button size="sm" onClick={() => setEdits(new Map())}>
+            <Button size="sm" onClick={discard}>
               <Undo2 size={13} /> Discard
             </Button>
           </>
         )}
-        {edit && !editable && <span className="ml-1 text-xs text-muted">Read-only (no primary key)</span>}
+        {edit && !editable && <span className="ml-1 text-xs text-muted">Read-only</span>}
+        {editable && !byPk && (
+          <span className="ml-1 text-xs text-warn" title="Updates and deletes match rows by every column value; duplicate rows are all affected.">
+            No primary key in result
+          </span>
+        )}
         <div className="flex-1" />
         {graphable && (
           <Tabs
@@ -301,17 +423,23 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
           {result.columns.length > 0 ? (
             <DataEditor
               columns={columns}
-              rows={order.length}
+              rows={order.length + added.length}
               getCellContent={getCellContent}
               getCellsForSelection={true}
               onCellEdited={editable ? onCellEdited : undefined}
+              onDelete={(sel) => {
+                // Del on selected row numbers marks rows deleted; on cells it clears them as usual.
+                if (!editable || !sel.rows.length) return editable;
+                toggleDelete(sel.rows.toArray());
+                return false;
+              }}
               gridSelection={selection}
               onGridSelectionChange={setSelection}
               onColumnResize={(_c, w, i) => setWidths((p) => ({ ...p, [i]: w }))}
               onHeaderClicked={(col) =>
                 setSort((s) => (s?.col !== col ? { col, dir: 1 } : s.dir === 1 ? { col, dir: -1 } : null))
               }
-              rowMarkers="number"
+              rowMarkers="clickable-number"
               smoothScrollX
               smoothScrollY
               theme={theme}
@@ -346,6 +474,19 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
                     <ClipboardCopy size={13} className="text-muted" /> {label}
                   </button>
                 ))}
+                {editable && (
+                  <>
+                    <button className="flex w-full items-center gap-2 border-t border-line px-3 py-1 text-left hover:bg-hover" onClick={setNull}>
+                      <Ban size={13} className="text-muted" /> Set NULL
+                    </button>
+                    <button className="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-hover" onClick={() => { setMenu(null); addRow(); }}>
+                      <Plus size={13} className="text-muted" /> Add row
+                    </button>
+                    <button className="flex w-full items-center gap-2 px-3 py-1 text-left hover:bg-hover" onClick={() => toggleDelete()}>
+                      <Trash2 size={13} className="text-muted" /> Delete / restore row
+                    </button>
+                  </>
+                )}
                 {onExport && (
                   <button className="flex w-full items-center gap-2 border-t border-line px-3 py-1 text-left hover:bg-hover" onClick={() => { setMenu(null); onExport(); }}>
                     <Download size={13} className="text-muted" /> Export…
@@ -396,26 +537,36 @@ export function ResultGrid({ result, dialect, onExport, onFetchAll, edit, onAppl
       {preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onMouseDown={() => setPreview(null)}>
           <div className="w-full max-w-3xl rounded-xl border border-line bg-panel shadow-2xl" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="border-b border-line px-4 py-2.5 text-sm font-semibold">Apply {preview.length} change(s)</div>
+            <div className="border-b border-line px-4 py-2.5 text-sm font-semibold">
+              Apply {preview.length} change(s)
+              {!autocommit && <span className="ml-2 text-xs font-normal text-muted">auto-commit is off: "Execute" leaves them in the open transaction</span>}
+            </div>
             <pre className="max-h-96 overflow-auto p-4 font-mono text-xs select-text">{preview.join(";\n") + ";"}</pre>
             {applyError && <div className="mx-4 mb-2 rounded bg-danger/10 px-3 py-2 text-xs text-danger select-text">{applyError}</div>}
             <div className="flex justify-end gap-2 border-t border-line px-4 py-2.5">
               <Button onClick={() => navigator.clipboard.writeText(preview.join(";\n") + ";")}>Copy SQL</Button>
               <Button onClick={() => setPreview(null)}>Cancel</Button>
-              <Button
-                variant="primary"
-                onClick={async () => {
-                  try {
-                    await onApplySql!(preview);
-                    setPreview(null);
-                    setEdits(new Map());
-                  } catch (e) {
-                    setApplyError(String(e));
-                  }
-                }}
-              >
-                Execute
-              </Button>
+              {(autocommit ? [false] : [false, true]).map((commit) => (
+                <Button
+                  key={String(commit)}
+                  variant={commit || autocommit ? "primary" : "default"}
+                  disabled={applying}
+                  onClick={async () => {
+                    setApplying(true);
+                    try {
+                      await onApplySql!(preview, commit);
+                      setPreview(null);
+                      discard();
+                    } catch (e) {
+                      setApplyError(e instanceof Error ? e.message : String(e));
+                    } finally {
+                      setApplying(false);
+                    }
+                  }}
+                >
+                  {commit ? "Execute & Commit" : "Execute"}
+                </Button>
+              ))}
             </div>
           </div>
         </div>

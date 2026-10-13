@@ -179,9 +179,11 @@ export function ObjectView({
               }
             }}
             edit={sqlish && d !== "clickhouse" && object.kind === "table" && cols ? { table, columns: cols } : undefined}
-            onApplySql={async (stmts) => {
+            autocommit={conn.autocommit}
+            onApplySql={async (stmts, commit) => {
               for (const s of stmts) await api.execute(conn.info.sessionId, s, 0);
-              if (conn.autocommit) await loadData();
+              if (commit) await api.commit(conn.info.sessionId);
+              if (conn.autocommit || commit) await loadData();
               else {
                 await loadData();
                 setError("Changes applied in the open transaction. Use Commit in a SQL tab (or auto-commit) to persist them.");

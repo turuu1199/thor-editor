@@ -10,6 +10,8 @@ export interface ThemeColors {
   accent: string;
   accentSoft: string;
   editBg: string;
+  insertBg: string;
+  deleteBg: string;
   dark: boolean;
 }
 
@@ -27,6 +29,8 @@ function read(): ThemeColors {
     accent: v("--accent"),
     accentSoft: v("--accent-soft"),
     editBg: dark ? "#4a3b12" : "#fef3c7",
+    insertBg: dark ? "#14402a" : "#dcfce7",
+    deleteBg: dark ? "#4c1d1d" : "#fee2e2",
     dark,
   };
 }

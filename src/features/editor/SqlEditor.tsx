@@ -23,11 +23,11 @@ import { Button, IconButton, Input, Modal, Spinner } from "../../components/ui";
 import { api, errorText, isSql, onSessionReconnected, type Dialect, type Plan, type QueryResult } from "../../lib/ipc";
 import { ExplainPlanView } from "./ExplainPlanView";
 import { editorTheme, useObjectHighlight } from "../../lib/editorTheme";
-import { explainSql, findBindVars, splitStatements, statementAt, substituteBinds, type Stmt } from "../../lib/sql";
+import { explainSql, findBindVars, qualified, splitStatements, statementAt, substituteBinds, type Stmt } from "../../lib/sql";
 import { useThemeColors } from "../../lib/theme";
 import { useApp, uid, type Connection, type EditorTab } from "../../store/app";
 import { ExportDialog } from "../export/ExportDialog";
-import { ResultGrid } from "../grid/ResultGrid";
+import { ResultGrid, type EditTarget } from "../grid/ResultGrid";
 import { modelConn, registerCompletion } from "./completion";
 import { attachInspections } from "./inspections";
 import { identifierAt, resolveIdentifier } from "./navigate";
@@ -475,6 +475,62 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
   }, []);
 
   const active = results.find((r) => r.id === activeResult);
+
+  // Result tab id -> table its rows can be edited in (null: not a plain single-table SELECT).
+  const [editTargets, setEditTargets] = useState<Record<string, EditTarget | null>>({});
+  useEffect(() => {
+    if (!active || active.id in editTargets) return;
+    const id = active.id;
+    editTargetFor(active.sql)
+      .catch(() => null)
+      .then((t) => setEditTargets((p) => ({ ...p, [id]: t })));
+  }, [active?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const editTargetFor = async (sql: string): Promise<EditTarget | null> => {
+    if (!["postgres", "mysql", "sqlite", "mssql", "oracle"].includes(dialect)) return null;
+    const stmt = sql.trim().replace(/;\s*$/, "");
+    if (!/^select\b/i.test(stmt) || /\b(group\s+by|distinct|union|intersect|minus|except|connect\s+by|pivot)\b/i.test(stmt)) return null;
+    const [a] = await api.sqlAnalyze(dialect, [stmt]);
+    if (!a || a.error || a.derived.length || a.tables.length !== 1 || a.tables[0].cte) return null;
+    const ident = (p: string) =>
+      /^["`[]/.test(p) ? p.slice(1, -1) : dialect === "oracle" ? p.toUpperCase() : dialect === "postgres" ? p.toLowerCase() : p;
+    const parts = a.tables[0].name.split(".").map(ident);
+    let name = parts[parts.length - 1];
+    let schema = parts.length > 1 ? parts[parts.length - 2] : conn.info.currentSchema;
+    if (dialect === "oracle") {
+      // Follows synonyms; only real tables are editable.
+      const o = await api.resolveObject(conn.info.sessionId, schema, name);
+      if (!o || o.kind !== "table") return null;
+      ({ schema, name } = o);
+    }
+    const columns = await api.tableColumns(conn.info.sessionId, schema, name);
+    return columns.length ? { table: qualified(dialect, schema, name), columns } : null;
+  };
+
+  /** Runs grid-generated DML in this session, optionally commits, then re-runs the result's query. */
+  const applyGridChanges = async (tab: ResultTab, stmts: string[], commit: boolean) => {
+    for (let i = 0; i < stmts.length; i++) {
+      try {
+        await api.execute(conn.info.sessionId, stmts[i], 0);
+      } catch (e) {
+        if (!conn.autocommit && i > 0) setTxPending(true);
+        const left = !conn.autocommit && i > 0 ? `\n${i} earlier statement(s) are pending in the transaction; Rollback to undo them.` : "";
+        throw new Error(`Statement ${i + 1} failed: ${errorText(e)}${left}`);
+      }
+    }
+    addLog(`${stmts.length} grid change(s) applied${conn.autocommit ? "" : commit ? " and committed" : " (not committed)"}.`, true);
+    if (commit) {
+      await api.commit(conn.info.sessionId);
+      setTxPending(false);
+    } else if (!conn.autocommit) setTxPending(true);
+    try {
+      const r = await api.execute(conn.info.sessionId, tab.sql, settings.fetchSize);
+      api.releaseResult(tab.result.resultId).catch(() => {});
+      setResults((rs) => rs.map((x) => (x.id === tab.id ? { ...x, result: r } : x)));
+    } catch (e) {
+      addLog(`Refresh failed: ${errorText(e)}`, false);
+    }
+  };
   const connHistory = history.filter((h) => h.conn === conn.profile.id).slice(0, 100);
 
   return (
@@ -707,6 +763,9 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
                 dialect={dialect}
                 fetchEdges={graphDb ? fetchEdges : undefined}
                 onExport={() => setExportFor(active)}
+                edit={editTargets[active.id] ?? undefined}
+                onApplySql={(stmts, commit) => applyGridChanges(active, stmts, commit)}
+                autocommit={conn.autocommit}
                 onFetchAll={async () => {
                   setRunning(true);
                   try {
