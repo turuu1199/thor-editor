@@ -305,6 +305,7 @@ export const api = {
   commit: (sessionId: string) => invoke<void>("commit", { sessionId }),
   rollback: (sessionId: string) => invoke<void>("rollback", { sessionId }),
   setAutocommit: (sessionId: string, on: boolean) => invoke<void>("set_autocommit", { sessionId, on }),
+  setCurrentSchema: (sessionId: string, schema: string) => invoke<string>("set_current_schema", { sessionId, schema }),
   releaseResult: (resultId: string) => invoke<void>("release_result", { resultId }),
   listSchemas: (sessionId: string) => invoke<string[]>("list_schemas", { sessionId }),
   listObjects: (sessionId: string, schema: string) => invoke<DbObject[]>("list_objects", { sessionId, schema }),

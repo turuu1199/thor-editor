@@ -1,5 +1,6 @@
 import { confirmAsk } from "../../lib/confirm";
 import Editor, { type OnMount } from "@monaco-editor/react";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import clsx from "clsx";
 import {
   AlignLeft,
@@ -16,6 +17,7 @@ import {
   Terminal,
   Eraser,
   Copy,
+  Save,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { canFormat, formatSql } from "../../lib/formatter";
@@ -25,6 +27,7 @@ import { ExplainPlanView } from "./ExplainPlanView";
 import { editorTheme, useObjectHighlight } from "../../lib/editorTheme";
 import { explainSql, findBindVars, qualified, splitStatements, statementAt, substituteBinds, type Stmt } from "../../lib/sql";
 import { useThemeColors } from "../../lib/theme";
+import { writeTextFile } from "../../lib/fs";
 import { useApp, uid, type Connection, type EditorTab } from "../../store/app";
 import { ExportDialog } from "../export/ExportDialog";
 import { ResultGrid, type EditTarget } from "../grid/ResultGrid";
@@ -92,7 +95,7 @@ const PLACEHOLDER: Partial<Record<Dialect, string>> = {
 };
 
 export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql" }>; conn: Connection }) {
-  const { updateSql, addHistory, settings, history, saveSnippet, setAutocommit, invalidateObjects, setConnStatus, openTab, setConnServerOutput, updateSettings } = useApp();
+  const { updateSql, setTabFile, addHistory, settings, history, saveSnippet, setAutocommit, setCurrentSchema, invalidateObjects, setConnStatus, openTab, setConnServerOutput, updateSettings } = useApp();
   const colors = useThemeColors();
   const dialect = conn.info.dialect;
   const graphDb = dialect === "neo4j" || dialect === "janusgraph";
@@ -419,8 +422,28 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
 
   const connRef = useRef(conn);
   connRef.current = conn;
-  const handlers = useRef({ runStatement, runScript, format, explain, openObject });
-  handlers.current = { runStatement, runScript, format, explain, openObject };
+  /** Ctrl+S: writes the tab to its file (asking for one the first time, or always with `as`). */
+  const saveFile = async (as = false) => {
+    const sql = editorRef.current?.getValue() ?? tab.sql;
+    let path: string | null | undefined = as ? undefined : tab.filePath;
+    if (!path) {
+      path = await saveDialog({
+        defaultPath: tab.filePath ?? `${tab.title.replace(/[\\/:*?"<>|]/g, "_").replace(/\.sql$/i, "")}.sql`,
+        filters: [{ name: "SQL", extensions: ["sql"] }, { name: "All files", extensions: ["*"] }],
+      });
+      if (!path) return;
+    }
+    try {
+      await writeTextFile(path, sql);
+      setTabFile(tab.id, path, sql);
+    } catch (e) {
+      addLog(`Save failed: ${errorText(e)}`, false);
+      setActiveResult("log");
+    }
+  };
+
+  const handlers = useRef({ runStatement, runScript, format, explain, openObject, saveFile });
+  handlers.current = { runStatement, runScript, format, explain, openObject, saveFile };
 
   const onMount: OnMount = (ed, monaco) => {
     editorRef.current = ed;
@@ -459,6 +482,8 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
     bind("runScript", "Execute as script", [K.F5, M.CtrlCmd | M.Shift | K.Enter], () => handlers.current.runScript());
     bind("format", "Format SQL", [M.CtrlCmd | M.Shift | K.KeyF], () => handlers.current.format());
     bind("explain", "Explain plan", [M.CtrlCmd | K.KeyE], () => handlers.current.explain());
+    bind("save", "Save to file", [M.CtrlCmd | K.KeyS], () => handlers.current.saveFile());
+    bind("saveAs", "Save to file as…", [M.CtrlCmd | M.Shift | K.KeyS], () => handlers.current.saveFile(true));
     ed.focus();
   };
 
@@ -475,6 +500,24 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
   }, []);
 
   const active = results.find((r) => r.id === activeResult);
+
+  // Current schema switcher (the session is shared by every SQL tab of this connection).
+  const canSwitchSchema = dialect === "oracle" || dialect === "postgres" || dialect === "mysql";
+  const [schemas, setSchemas] = useState<string[]>([]);
+  useEffect(() => {
+    if (canSwitchSchema) api.listSchemas(conn.info.sessionId).then(setSchemas).catch(() => {});
+  }, [conn.info.sessionId, canSwitchSchema]);
+  const currentSchema = schemas.find((x) => x.toLowerCase() === conn.info.currentSchema.toLowerCase()) ?? conn.info.currentSchema;
+  const switchSchema = async (schema: string) => {
+    try {
+      const now = await api.setCurrentSchema(conn.info.sessionId, schema);
+      setCurrentSchema(conn.key, now || schema);
+      addLog(`Current schema: ${now || schema}`, true);
+    } catch (e) {
+      addLog(errorText(e), false);
+      setActiveResult("log");
+    }
+  };
 
   // Result tab id -> table its rows can be edited in (null: not a plain single-table SELECT).
   const [editTargets, setEditTargets] = useState<Record<string, EditTarget | null>>({});
@@ -553,6 +596,9 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
         <IconButton title="Format SQL (Ctrl+Shift+F)" onClick={format}>
           <AlignLeft size={16} />
         </IconButton>
+        <IconButton title={tab.filePath ? `Save to ${tab.filePath} (Ctrl+S; Ctrl+Shift+S: save as)` : "Save to file (Ctrl+S)"} onClick={() => saveFile()}>
+          <Save size={15} />
+        </IconButton>
         <IconButton
           title="Save selection as snippet"
           onClick={() => {
@@ -616,6 +662,22 @@ export function SqlEditor({ tab, conn }: { tab: Extract<EditorTab, { kind: "sql"
           <span className="inline-flex items-center gap-1.5 text-xs text-muted">
             <Spinner size={12} /> {progress || "Running…"}
           </span>
+        )}
+        {canSwitchSchema && (
+          <select
+            className="ml-2 h-7 max-w-48 rounded-md border border-line bg-panel px-1 text-xs outline-none"
+            value={currentSchema}
+            onChange={(e) => switchSchema(e.target.value)}
+            disabled={running}
+            title="Current schema for unqualified names (all SQL tabs of this connection)"
+          >
+            {!schemas.includes(currentSchema) && <option value={currentSchema}>{currentSchema || "—"}</option>}
+            {schemas.map((x) => (
+              <option key={x} value={x}>
+                {x}
+              </option>
+            ))}
+          </select>
         )}
       </div>
 

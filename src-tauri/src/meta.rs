@@ -56,6 +56,21 @@ pub async fn current_schema(s: &dyn Session) -> Result<String> {
     Ok(rows(s, sql).await?.first().map(|r| text(r.first())).unwrap_or_default())
 }
 
+/// Makes `schema` the session's default for unqualified names; returns the resulting schema.
+pub async fn set_current_schema(s: &dyn Session, schema: &str) -> Result<String> {
+    let d = s.dialect();
+    let q = quote_ident(d, schema);
+    let sql = match d {
+        Dialect::Oracle => format!("alter session set current_schema = {q}"),
+        Dialect::Postgres if schema == "public" => "set search_path to public".to_string(),
+        Dialect::Postgres => format!("set search_path to {q}, public"),
+        Dialect::Mysql => format!("use {q}"),
+        _ => anyhow::bail!("Switching the current schema is not supported for this database"),
+    };
+    s.exec(&sql).await?;
+    current_schema(s).await
+}
+
 pub async fn list_objects(s: &dyn Session, schema: &str) -> Result<Vec<DbObject>> {
     if let Some(v) = s.native_objects(schema).await? {
         return Ok(v);

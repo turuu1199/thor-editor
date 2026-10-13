@@ -1,5 +1,5 @@
 import Editor from "@monaco-editor/react";
-import { Copy, FileInput, KeyRound, RefreshCw, Upload } from "lucide-react";
+import { Copy, FileInput, KeyRound, Network, RefreshCw, Upload } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Button, Spinner, Tabs } from "../../components/ui";
 import { api, errorText, isSql, type ColumnInfo, type DbObject, type QueryResult } from "../../lib/ipc";
@@ -142,6 +142,16 @@ export function ObjectView({
         >
           <RefreshCw size={13} /> Refresh
         </Button>
+        {sqlish && d !== "clickhouse" && object.kind === "table" && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => openTab({ id: uid(), connKey: conn.key, kind: "er", title: `ER: ${object.name}`, schema: object.schema, tables: [object.name] })}
+            title="ER diagram of this table and its related tables"
+          >
+            <Network size={13} /> ER diagram
+          </Button>
+        )}
         {sqlish && object.kind === "table" && onImport && (
           <Button size="sm" variant="ghost" onClick={() => onImport(object.schema, object.name)} title="Import CSV / Excel into this table">
             <Upload size={13} /> Import

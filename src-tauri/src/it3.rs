@@ -93,7 +93,7 @@ async fn it_oracle_reconnect_after_kill() {
     state.sessions.insert("S".into(), s);
     state.reconnect_info.insert(
         "S".into(),
-        ReconnectInfo { profile: p, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: false },
+        ReconnectInfo { profile: p, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: false, schema: None },
     );
     let admin = connect(&prof("system"), "Passw0rd!", "").await.unwrap().session;
     let kill = || async {
@@ -278,7 +278,7 @@ async fn it_oracle_session_browser() {
     let state = AppState::new(crate::store::ProfileStore::new(dir.clone()).unwrap());
     let sys = prof("system");
     state.sessions.insert("S".into(), connect(&sys, "Passw0rd!", "").await.unwrap().session);
-    state.reconnect_info.insert("S".into(), ReconnectInfo { profile: sys, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: false });
+    state.reconnect_info.insert("S".into(), ReconnectInfo { profile: sys, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: false, schema: None });
 
     let list = state.session_list_for_test("S").await;
     let mine: Vec<_> = list.iter().filter(|s| s.user == "TEST").collect();
@@ -316,7 +316,7 @@ async fn it_oracle_dbms_output() {
     let s = connect(&p, "Passw0rd!", "").await.unwrap().session;
     assert!(s.set_server_output(true).await.unwrap(), "oracle supports server output");
     state.sessions.insert("S".into(), s.clone());
-    state.reconnect_info.insert("S".into(), ReconnectInfo { profile: p, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: true });
+    state.reconnect_info.insert("S".into(), ReconnectInfo { profile: p, password: "Passw0rd!".into(), ssh_secret: String::new(), autocommit: true, server_output: true, schema: None });
 
     let r = state
         .execute_sql("S", "BEGIN FOR i IN 1 .. 3 LOOP DBMS_OUTPUT.PUT_LINE('row ' || i); END LOOP; DBMS_OUTPUT.PUT_LINE(''); DBMS_OUTPUT.PUT_LINE('Сайн уу'); END;", None)

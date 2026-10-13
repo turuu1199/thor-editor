@@ -62,7 +62,10 @@ export function Workspace({ conn, visible }: { conn: Connection; visible: boolea
               ) : (
                 kindIcon(t.object.kind, 13)
               )}
-              <span className="max-w-44 truncate">{t.title}</span>
+              <span className="max-w-44 truncate" title={t.kind === "sql" ? t.filePath : undefined}>
+                {t.title}
+                {t.kind === "sql" && t.filePath && t.sql !== t.savedSql && <span className="text-warn"> ●</span>}
+              </span>
               <button
                 className="rounded opacity-50 hover:bg-hover hover:opacity-100"
                 title="Close tab"
@@ -93,7 +96,7 @@ export function Workspace({ conn, visible }: { conn: Connection; visible: boolea
               {t.kind === "sql" ? (
                 <SqlEditor tab={t} conn={conn} />
               ) : t.kind === "er" ? (
-                <ErDiagram conn={conn} schema={t.schema} />
+                <ErDiagram conn={conn} schema={t.schema} tables={t.tables} />
               ) : t.kind === "sessions" ? (
                 <SessionBrowser conn={conn} visible={visible && active === t.id} />
               ) : (

@@ -1,6 +1,6 @@
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "../../lib/fs";
-import { Download, Maximize2, RefreshCw, Search } from "lucide-react";
+import { Download, Maximize2, Plus, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Input, Spinner } from "../../components/ui";
 import { api, errorText, type ColumnInfo, type ForeignKey } from "../../lib/ipc";
@@ -49,10 +49,28 @@ function layout(names: string[], cols: Record<string, ColumnInfo[]>, fks: Foreig
   });
 }
 
-export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }) {
+/** Tables linked to `names` by a foreign key (either direction), excluding `names` themselves. */
+function neighbours(names: Iterable<string>, fks: ForeignKey[]): string[] {
+  const set = new Set(names);
+  const out = new Set<string>();
+  for (const f of fks) {
+    if (set.has(f.table) && !set.has(f.refTable)) out.add(f.refTable);
+    if (set.has(f.refTable) && !set.has(f.table)) out.add(f.table);
+  }
+  return [...out];
+}
+
+/**
+ * `tables`: start from these tables and their direct relations (ERD for a table);
+ * otherwise the whole schema, or its most connected tables when it is large.
+ */
+export function ErDiagram({ conn, schema, tables }: { conn: Connection; schema: string; tables?: string[] }) {
   const colors = useThemeColors();
   const [boxes, setBoxes] = useState<Box[]>([]);
-  const [fks, setFks] = useState<ForeignKey[]>([]);
+  const [allTables, setAllTables] = useState<string[]>([]);
+  const [allFks, setAllFks] = useState<ForeignKey[]>([]);
+  const [adding, setAdding] = useState("");
+  const colCache = useRef<Record<string, ColumnInfo[]>>({});
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
@@ -62,36 +80,86 @@ export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }
   const svgRef = useRef<SVGSVGElement>(null);
   const drag = useRef<{ kind: "pan" | "box"; name?: string; sx: number; sy: number; ox: number; oy: number } | null>(null);
 
+  const loadColumns = async (names: string[]) => {
+    const missing = names.filter((n) => !(n in colCache.current));
+    for (let i = 0; i < missing.length; i++) {
+      setLoading(`Loading columns ${i + 1}/${missing.length}…`);
+      colCache.current[missing[i]] = await api.tableColumns(conn.info.sessionId, schema, missing[i]).catch(() => []);
+    }
+    return colCache.current;
+  };
+
   const load = useCallback(async () => {
     setError("");
     setLoading("Loading tables…");
+    colCache.current = {};
     try {
       const sid = conn.info.sessionId;
-      const objs = (await api.listObjects(sid, schema)).filter((o) => o.kind === "table");
-      const names = objs.map((o) => o.name).slice(0, MAX_TABLES);
-      setNote(objs.length > MAX_TABLES ? `Showing ${MAX_TABLES} of ${objs.length} tables (use the filter to focus).` : "");
+      const names = (await api.listObjects(sid, schema)).filter((o) => o.kind === "table").map((o) => o.name);
+      const known = new Set(names);
       setLoading("Loading foreign keys…");
-      const fk = (await api.foreignKeys(sid, schema)).filter((f) => names.includes(f.table) && names.includes(f.refTable));
-      const cols: Record<string, ColumnInfo[]> = {};
-      for (let i = 0; i < names.length; i++) {
-        setLoading(`Loading columns ${i + 1}/${names.length}…`);
-        cols[names[i]] = await api.tableColumns(sid, schema, names[i]).catch(() => []);
+      const fk = (await api.foreignKeys(sid, schema)).filter((f) => known.has(f.table) && known.has(f.refTable));
+      let pick: string[];
+      if (tables?.length) {
+        const seeds = tables.filter((t) => known.has(t));
+        pick = [...seeds, ...neighbours(seeds, fk)];
+        setNote(pick.length > MAX_TABLES ? `Showing ${MAX_TABLES} of ${pick.length} related tables.` : "");
+      } else if (names.length > MAX_TABLES) {
+        // Large schema: the most connected tables say the most about its structure.
+        const degree: Record<string, number> = {};
+        for (const f of fk) for (const t of [f.table, f.refTable]) degree[t] = (degree[t] ?? 0) + 1;
+        pick = [...names].sort((a, b) => (degree[b] ?? 0) - (degree[a] ?? 0) || a.localeCompare(b));
+        setNote(`Showing the ${MAX_TABLES} most connected of ${names.length} tables. Add tables or double-click one to expand its relations.`);
+      } else {
+        pick = names;
+        setNote("");
       }
-      setFks(fk);
-      setBoxes(layout(names, cols, fk));
+      pick = pick.slice(0, MAX_TABLES);
+      const cols = await loadColumns(pick);
+      setAllTables(names);
+      setAllFks(fk);
+      setBoxes(layout(pick, cols, fk.filter((f) => pick.includes(f.table) && pick.includes(f.refTable))));
       setView({ x: 0, y: 0, k: 1 });
     } catch (e) {
       setError(errorText(e));
     } finally {
       setLoading("");
     }
-  }, [conn.info.sessionId, schema]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conn.info.sessionId, schema, tables?.join(",")]);
+
+  /** Adds tables to the diagram in a new column next to `anchor` (or right of everything). */
+  const addTables = async (names: string[], anchor?: Box) => {
+    const shown = new Set(boxes.map((b) => b.name));
+    const fresh = names.filter((n) => !shown.has(n));
+    if (!fresh.length) return;
+    try {
+      const cols = await loadColumns(fresh);
+      setBoxes((bs) => {
+        const x = anchor ? anchor.x + BOX_W + 90 : Math.max(-70, ...bs.map((b) => b.x)) + BOX_W + 90;
+        let y = anchor ? anchor.y : Math.min(20, ...bs.map((b) => b.y));
+        const added = fresh.map((name) => {
+          const b: Box = { name, cols: cols[name] ?? [], x, y };
+          y += boxHeight(b) + 40;
+          return b;
+        });
+        return [...bs, ...added];
+      });
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const expand = (b: Box) => addTables(neighbours([b.name], allFks), b);
+  const remove = (name: string) => setBoxes((bs) => bs.filter((b) => b.name !== name));
 
   useEffect(() => {
     load();
   }, [load]);
 
   const byName = useMemo(() => Object.fromEntries(boxes.map((b) => [b.name, b])), [boxes]);
+  const fks = useMemo(() => allFks.filter((f) => f.table in byName && f.refTable in byName), [allFks, byName]);
+  const addable = useMemo(() => allTables.filter((t) => !(t in byName)), [allTables, byName]);
   const q = filter.trim().toLowerCase();
   const visible = useMemo(() => {
     if (!q) return new Set(boxes.map((b) => b.name));
@@ -195,7 +263,23 @@ export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }
           <Search size={13} className="absolute left-2 top-2 text-muted" />
           <Input className="h-7 pl-7 text-xs" placeholder="Focus tables…" value={filter} onChange={(e) => setFilter(e.target.value)} />
         </div>
-        {note && <span className="text-xs text-warn">{note}</span>}
+        <form
+          className="relative w-56"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const name = allTables.find((t) => t.toLowerCase() === adding.trim().toLowerCase());
+            if (name) addTables([name]).then(() => setAdding(""));
+          }}
+        >
+          <Plus size={13} className="absolute left-2 top-2 text-muted" />
+          <Input className="h-7 pl-7 text-xs" placeholder="Add table…" list="er-add-tables" value={adding} onChange={(e) => setAdding(e.target.value)} />
+          <datalist id="er-add-tables">
+            {addable.map((t) => (
+              <option key={t} value={t} />
+            ))}
+          </datalist>
+        </form>
+        {note && <span className="truncate text-xs text-warn" title={note}>{note}</span>}
         <div className="flex-1" />
         {loading && (
           <span className="inline-flex items-center gap-1.5 text-xs text-muted">
@@ -251,6 +335,10 @@ export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }
                 key={b.name}
                 transform={`translate(${b.x},${b.y})`}
                 onMouseDown={(e) => onMouseDown(e, b.name)}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  expand(b);
+                }}
                 onMouseEnter={() => setHover(b.name)}
                 onMouseLeave={() => setHover(null)}
                 style={{ cursor: "move" }}
@@ -258,8 +346,23 @@ export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }
                 <rect width={BOX_W} height={h} rx={6} fill={colors.panel} stroke={hover === b.name ? colors.accent : colors.line} strokeWidth={1.5} />
                 <path d={`M0 6 a6 6 0 0 1 6 -6 h${BOX_W - 12} a6 6 0 0 1 6 6 v${HEAD_H - 6} h-${BOX_W} z`} fill={colors.accentSoft} />
                 <text x={10} y={17} fontSize={12} fontWeight={600} fill={colors.fg}>
-                  {b.name.length > 30 ? b.name.slice(0, 29) + "…" : b.name}
+                  {b.name.length > 28 ? b.name.slice(0, 27) + "…" : b.name}
                 </text>
+                <title>{`${b.name} — double-click to add related tables`}</title>
+                {hover === b.name && (
+                  <text
+                    x={BOX_W - 10}
+                    y={17}
+                    fontSize={13}
+                    textAnchor="end"
+                    fill={colors.muted}
+                    style={{ cursor: "pointer" }}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => remove(b.name)}
+                  >
+                    ✕<title>Remove from diagram</title>
+                  </text>
+                )}
                 {b.cols.slice(0, MAX_ROWS).map((c, i) => (
                   <g key={c.name} transform={`translate(0,${HEAD_H + i * ROW_H + 2})`}>
                     <text x={10} y={13} fontSize={11} fill={c.primaryKey ? colors.accent : colors.fg} fontWeight={c.primaryKey ? 600 : 400}>
@@ -281,7 +384,7 @@ export function ErDiagram({ conn, schema }: { conn: Connection; schema: string }
         </g>
       </svg>
       <div className="border-t border-line bg-panel-2 px-3 py-1 text-[11px] text-muted">
-        Drag tables to arrange · drag background to pan · scroll to zoom · 🔑 primary key · ↗ foreign key
+        Drag tables to arrange · double-click a table to add its related tables · drag background to pan · scroll to zoom · 🔑 primary key · ↗ foreign key
       </div>
     </div>
   );

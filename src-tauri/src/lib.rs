@@ -49,6 +49,7 @@ pub fn run() {
             commands::commit,
             commands::rollback,
             commands::set_autocommit,
+            commands::set_current_schema,
             commands::release_result,
             commands::list_schemas,
             commands::list_objects,

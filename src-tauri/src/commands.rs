@@ -34,6 +34,8 @@ pub struct ReconnectInfo {
     pub autocommit: bool,
     /// Re-enable DBMS_OUTPUT after a reconnect.
     pub server_output: bool,
+    /// Schema picked in the editor, restored after a reconnect.
+    pub schema: Option<String>,
 }
 
 /// Idle sessions are pinged this often so server/firewall idle timeouts don't drop them.
@@ -84,6 +86,9 @@ impl AppState {
         c.session.set_autocommit(info.autocommit).await?;
         if info.server_output {
             let _ = c.session.set_server_output(true).await;
+        }
+        if let Some(schema) = &info.schema {
+            let _ = meta::set_current_schema(c.session.as_ref(), schema).await;
         }
         self.sessions.insert(id.to_string(), c.session.clone());
         self.own_sids.remove(id);
@@ -284,6 +289,7 @@ pub async fn connect(
             ssh_secret,
             autocommit: profile.autocommit_default(),
             server_output: false,
+            schema: None,
         },
     );
     spawn_keepalive(app, id.clone());
@@ -393,6 +399,20 @@ pub async fn set_autocommit(state: State<'_, AppState>, session_id: String, on: 
         r.autocommit = on;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn set_current_schema(state: State<'_, AppState>, session_id: String, schema: String) -> CmdResult<String> {
+    let current = state
+        .with_retry(&session_id, |s| {
+            let schema = schema.clone();
+            async move { meta::set_current_schema(s.as_ref(), &schema).await }
+        })
+        .await?;
+    if let Some(mut r) = state.reconnect_info.get_mut(&session_id) {
+        r.schema = Some(schema);
+    }
+    Ok(current)
 }
 
 /// Pings the session every few minutes; if the ping shows the connection died, reconnects
